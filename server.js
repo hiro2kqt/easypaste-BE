@@ -15,6 +15,8 @@ const RATE_LIMIT_MS = 500;
 const rateLimitStore = new Map();
 
 function rateLimitByIpAgent(req, res, next) {
+  if (req.method === "OPTIONS") return next();
+
   const ip =
     req.headers["x-forwarded-for"]?.split(",")[0] ||
     req.socket.remoteAddress ||
