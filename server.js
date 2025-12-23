@@ -78,11 +78,7 @@ function generateSessionCode() {
     String.fromCharCode(65 + Math.floor(Math.random() * 26))
   ).join("");
 
-  const digitLength = 4 + Math.floor(Math.random() * 3);
-  let digits = "";
-  for (let i = 0; i < digitLength; i++) {
-    digits += Math.floor(Math.random() * 10).toString();
-  }
+  const digits = Math.floor(100000 + Math.random() * 900000).toString();
 
   return `${letters}${digits}`;
 }
