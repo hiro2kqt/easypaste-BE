@@ -74,7 +74,7 @@ function saveUploadState(data) {
 }
 
 function generateSessionCode() {
-  const digitLength = 3 + Math.floor(Math.random() * 3);
+  const digitLength = 4 + Math.floor(Math.random() * 3);
   let digits = "";
   for (let i = 0; i < digitLength; i++) {
     digits += Math.floor(Math.random() * 10).toString();
