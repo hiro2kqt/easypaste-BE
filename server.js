@@ -36,6 +36,7 @@ app.use(bodyParser.json({ limit: "10mb" }));
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const TMP_UPLOAD_DIR = path.join(__dirname, "uploads_tmp");
+const STORE_FILE = path.join(__dirname, "store.json");
 const FILESTORE_FILE = path.join(__dirname, "fileStore.json");
 
 for (const dir of [UPLOAD_DIR, TMP_UPLOAD_DIR]) {
@@ -43,6 +44,20 @@ for (const dir of [UPLOAD_DIR, TMP_UPLOAD_DIR]) {
     fs.mkdirSync(dir, { recursive: true });
     console.log("[INIT] Created dir:", dir);
   }
+}
+
+function loadJSON(filePath) {
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (e) {
+    console.error("[STORE] parse error:", filePath, e.message);
+    return {};
+  }
+}
+
+function saveJSON(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
 function loadUploadState() {
@@ -58,9 +73,39 @@ function saveUploadState(data) {
   fs.writeFileSync(UPLOAD_STATE_FILE, JSON.stringify(data, null, 2));
 }
 
+function generateSessionCode() {
+  const letters = Array.from({ length: 2 }, () =>
+    String.fromCharCode(65 + Math.floor(Math.random() * 26))
+  ).join("");
+
+  const digitLength = 4 + Math.floor(Math.random() * 3);
+  let digits = "";
+  for (let i = 0; i < digitLength; i++) {
+    digits += Math.floor(Math.random() * 10).toString();
+  }
+
+  return `${letters}${digits}`;
+}
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, UPLOAD_DIR);
+  },
+  filename: (_req, _file, cb) => {
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    const ext = path.extname(_file.originalname);
+    cb(null, `${unique}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_SIZE },
+});
+
 const chunkUpload = multer({
   storage: multer.diskStorage({
-    destination: (req, file, cb) => {
+    destination: (req, _file, cb) => {
       const { fileId } = req.body;
       if (!fileId) return cb(new Error("Missing fileId"));
 
@@ -68,7 +113,7 @@ const chunkUpload = multer({
       fs.mkdirSync(dir, { recursive: true });
       cb(null, dir);
     },
-    filename: (req, file, cb) => {
+    filename: (req, _file, cb) => {
       cb(null, `${req.body.chunkIndex}.part`);
     },
   }),
@@ -77,30 +122,70 @@ const chunkUpload = multer({
   },
 });
 
-function loadJSON(filePath) {
-  if (!fs.existsSync(filePath)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return {};
-  }
-}
+app.post("/api/session", (_req, res) => {
+  const store = loadJSON(STORE_FILE);
+  const fileStore = loadJSON(FILESTORE_FILE);
 
-function saveJSON(filePath, data) {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-}
+  let code;
+  do {
+    code = generateSessionCode();
+  } while (store[code] || fileStore[code]);
+
+  store[code] = {
+    type: "text",
+    content: "",
+    lastUpdated: Date.now(),
+  };
+
+  saveJSON(STORE_FILE, store);
+  res.json({ code });
+});
+
+app.post("/api/publish", (req, res) => {
+  const { code, type, content } = req.body;
+  if (!code || !content || type !== "text") {
+    return res.status(400).json({ error: "Invalid data" });
+  }
+
+  const store = loadJSON(STORE_FILE);
+  store[code] = { type, content, lastUpdated: Date.now() };
+  saveJSON(STORE_FILE, store);
+
+  res.json({ ok: true });
+});
+
+app.get("/api/get/:code", (req, res) => {
+  const store = loadJSON(STORE_FILE);
+  const data = store[req.params.code];
+  if (!data) return res.status(404).json({ error: "Not found" });
+  res.json(data);
+});
+
+app.post("/api/file/upload", upload.single("file"), (req, res) => {
+  const { code } = req.body;
+  const file = req.file;
+
+  if (!code || !file) {
+    return res.status(400).json({ error: "Missing code or file" });
+  }
+
+  const fileStore = loadJSON(FILESTORE_FILE);
+  fileStore[code] = {
+    originalName: file.originalname,
+    size: file.size,
+    path: file.path,
+    uploadedAt: Date.now(),
+  };
+
+  saveJSON(FILESTORE_FILE, fileStore);
+  res.json({ ok: true });
+});
 
 app.post("/api/file/chunk", chunkUpload.single("file"), (req, res) => {
-  const { code, fileId, chunkIndex, totalChunks, fileName } = req.body;
+  const { code, fileId, chunkIndex, fileName } = req.body;
   const chunkSize = req.file?.size || 0;
 
-  if (
-    !code ||
-    !fileId ||
-    chunkIndex === undefined ||
-    !totalChunks ||
-    !fileName
-  ) {
+  if (!code || !fileId || chunkIndex === undefined || !fileName) {
     return res.status(400).json({ error: "Missing fields" });
   }
 
@@ -123,125 +208,94 @@ app.post("/api/file/chunk", chunkUpload.single("file"), (req, res) => {
   state[fileId].chunks[chunkIndex] = chunkSize;
 
   if (state[fileId].totalSize > MAX_FILE_SIZE) {
-    const chunkPath = req.file.path;
-    if (fs.existsSync(chunkPath)) fs.unlinkSync(chunkPath);
-
+    fs.unlinkSync(req.file.path);
     delete state[fileId].chunks[chunkIndex];
     state[fileId].totalSize -= chunkSize;
-
     saveUploadState(state);
-
-    console.warn("[CHUNK] size limit exceeded", {
-      fileId,
-      totalSize: state[fileId].totalSize,
-    });
-
     return res.status(413).json({ error: "File exceeds 10MB limit" });
   }
 
   saveUploadState(state);
-
-  console.log("[CHUNK]", {
-    code,
-    fileId,
-    chunkIndex,
-    size: chunkSize,
-    totalSize: state[fileId].totalSize,
-  });
-
   res.json({ ok: true });
 });
 
 app.post("/api/file/finalize", (req, res) => {
   const { code, fileId, totalChunks, fileName } = req.body;
-
-  if (!code || !fileId || !totalChunks || !fileName) {
-    return res.status(400).json({ error: "Missing fields" });
-  }
-
   const state = loadUploadState();
   const meta = state[fileId];
 
-  if (!meta) {
-    return res.status(400).json({ error: "Upload state not found" });
-  }
-
-  if (meta.totalSize > MAX_FILE_SIZE) {
+  if (!meta) return res.status(400).json({ error: "Upload state not found" });
+  if (meta.totalSize > MAX_FILE_SIZE)
     return res.status(413).json({ error: "File too large" });
-  }
-
-  const uploadedChunkCount = Object.keys(meta.chunks).length;
-  if (uploadedChunkCount !== Number(totalChunks)) {
-    return res.status(400).json({
-      error: "Missing chunks",
-      uploadedChunkCount,
-    });
-  }
 
   const chunkDir = path.join(TMP_UPLOAD_DIR, fileId);
-  if (!fs.existsSync(chunkDir)) {
-    return res.status(400).json({ error: "Chunk dir not found" });
-  }
-
-  const ext = path.extname(fileName);
-  const finalName = `${uuidv4()}${ext}`;
+  const finalName = `${uuidv4()}${path.extname(fileName)}`;
   const finalPath = path.join(UPLOAD_DIR, finalName);
-  const writeStream = fs.createWriteStream(finalPath);
 
-  try {
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkPath = path.join(chunkDir, `${i}.part`);
-      if (!fs.existsSync(chunkPath)) {
-        writeStream.close();
-        return res.status(400).json({ error: `Missing chunk ${i}` });
-      }
-      writeStream.write(fs.readFileSync(chunkPath));
-    }
-  } catch (e) {
-    writeStream.close();
-    return res.status(500).json({ error: "Merge failed" });
+  const ws = fs.createWriteStream(finalPath);
+  for (let i = 0; i < totalChunks; i++) {
+    const p = path.join(chunkDir, `${i}.part`);
+    if (!fs.existsSync(p))
+      return res.status(400).json({ error: "Missing chunk" });
+    ws.write(fs.readFileSync(p));
   }
+  ws.end();
 
-  writeStream.end();
-
-  writeStream.on("close", () => {
+  ws.on("close", () => {
     fs.rmSync(chunkDir, { recursive: true, force: true });
     delete state[fileId];
     saveUploadState(state);
 
     const fileStore = loadJSON(FILESTORE_FILE);
-    const now = Date.now();
-
     fileStore[code] = {
-      fileId,
       originalName: fileName,
       storedName: finalName,
       path: finalPath,
       size: fs.statSync(finalPath).size,
-      uploadedAt: now,
-      lastUpdated: now,
+      uploadedAt: Date.now(),
     };
-
     saveJSON(FILESTORE_FILE, fileStore);
 
-    console.log("[FINALIZE] done:", finalPath);
-
-    res.json({
-      ok: true,
-      file: {
-        originalName: fileName,
-        storedName: finalName,
-        size: fileStore[code].size,
-      },
-    });
+    res.json({ ok: true });
   });
 });
 
-app.get("/api/ping", (req, res) => {
+app.get("/api/file/meta/:code", (req, res) => {
+  const fileStore = loadJSON(FILESTORE_FILE);
+  if (!fileStore[req.params.code])
+    return res.status(404).json({ error: "Not found" });
+  res.json({ file: fileStore[req.params.code] });
+});
+
+app.get("/api/file/download/:code", (req, res) => {
+  const fileStore = loadJSON(FILESTORE_FILE);
+  const data = fileStore[req.params.code];
+  if (!data || !fs.existsSync(data.path))
+    return res.status(404).json({ error: "Not found" });
+  res.download(data.path, data.originalName);
+});
+
+app.delete("/api/session/:code", (req, res) => {
+  const code = req.params.code;
+  const store = loadJSON(STORE_FILE);
+  const fileStore = loadJSON(FILESTORE_FILE);
+
+  delete store[code];
+  if (fileStore[code]?.path && fs.existsSync(fileStore[code].path)) {
+    fs.unlinkSync(fileStore[code].path);
+  }
+  delete fileStore[code];
+
+  saveJSON(STORE_FILE, store);
+  saveJSON(FILESTORE_FILE, fileStore);
+  res.json({ ok: true });
+});
+
+app.get("/api/ping", (_req, res) => {
   res.json({ pong: true });
 });
 
-app.use((err, req, res, next) => {
+app.use((err, _req, res, _next) => {
   console.error("[ERROR]", err);
   res.status(500).json({ error: err.message });
 });

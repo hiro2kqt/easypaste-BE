@@ -43,3 +43,7 @@ jspm_packages/
 .DS_Store
 Thumbs.db
 uploads/
+
+store.json
+fileStore.json
+uploadState.json
