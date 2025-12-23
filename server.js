@@ -9,7 +9,7 @@ const { v4: uuidv4 } = require("uuid");
 const app = express();
 const PORT = 8031;
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const UPLOAD_STATE_FILE = path.join(__dirname, "uploadState.json");
 const RATE_LIMIT_MS = 500;
 const rateLimitStore = new Map();
@@ -58,7 +58,7 @@ app.use((req, res, next) => {
 });
 app.use(rateLimitByIpAgent);
 app.use(cors());
-app.use(bodyParser.json({ limit: "10mb" }));
+app.use(bodyParser.json({ limit: "20mb" }));
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const TMP_UPLOAD_DIR = path.join(__dirname, "uploads_tmp");
