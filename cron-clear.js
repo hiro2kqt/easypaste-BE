@@ -10,6 +10,7 @@ const FILESTORE_FILE = path.join(__dirname, "fileStore.json");
 const UPLOAD_STATE_FILE = path.join(__dirname, "uploadState.json");
 
 const EXPIRATION_MS = 10 * 60 * 1000;
+const HOLD_LONGER_EXPIRATION_MS = 2 * 60 * 60 * 1000;
 const LOOP_INTERVAL_MS = 2000;
 
 function sleep(ms) {
@@ -30,6 +31,10 @@ function saveJSON(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
+function getExpirationMs(record) {
+  return record?.holdLonger === true ? HOLD_LONGER_EXPIRATION_MS : EXPIRATION_MS;
+}
+
 async function cleanupLoop() {
   console.log("[CRON] Cleanup loop started.");
 
@@ -46,8 +51,9 @@ async function cleanupLoop() {
       let removedChunks = 0;
 
       for (const code of Object.keys(store)) {
-        const last = store[code]?.lastUpdated || 0;
-        if (now - last > EXPIRATION_MS) {
+        const record = store[code];
+        const last = record?.lastUpdated || 0;
+        if (now - last > getExpirationMs(record)) {
           delete store[code];
           removedSessions++;
         }
@@ -57,7 +63,7 @@ async function cleanupLoop() {
         const meta = fileStore[code];
         const ts = meta.uploadedAt || 0;
 
-        if (now - ts > EXPIRATION_MS) {
+        if (now - ts > getExpirationMs(meta)) {
           const filePath = path.resolve(meta.path || "");
 
           if (filePath.startsWith(UPLOAD_DIR) && fs.existsSync(filePath)) {
@@ -77,7 +83,7 @@ async function cleanupLoop() {
         const state = uploadState[fileId];
         const createdAt = state.createdAt || 0;
 
-        if (now - createdAt > EXPIRATION_MS) {
+        if (now - createdAt > getExpirationMs(state)) {
           const chunkDir = path.join(TMP_UPLOAD_DIR, fileId);
 
           if (fs.existsSync(chunkDir)) {

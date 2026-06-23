@@ -9,10 +9,29 @@ const { v4: uuidv4 } = require("uuid");
 const app = express();
 const PORT = 8031;
 
-const MAX_FILE_SIZE = 20 * 1024 * 1024;
+function getPositiveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const MAX_FILE_SIZE = getPositiveIntEnv("MAX_FILE_SIZE", 20 * 1024 * 1024);
+const MAX_CHUNK_SIZE = getPositiveIntEnv(
+  "MAX_CHUNK_SIZE",
+  2 * 1024 * 1024
+);
 const UPLOAD_STATE_FILE = path.join(__dirname, "uploadState.json");
 const RATE_LIMIT_MS = 500;
 const rateLimitStore = new Map();
+let sessionCreateQueue = Promise.resolve();
+
+function runExclusive(task) {
+  const next = sessionCreateQueue.then(() => task());
+  sessionCreateQueue = next.catch(() => {});
+  return next;
+}
 
 function rateLimitByIpAgent(req, res, next) {
   if (req.method === "OPTIONS") return next();
@@ -100,13 +119,47 @@ function saveUploadState(data) {
 }
 
 function generateSessionCode() {
-  const digitLength = 4 + Math.floor(Math.random() * 3);
-  let digits = "";
-  for (let i = 0; i < digitLength; i++) {
-    digits += Math.floor(Math.random() * 10).toString();
+  return `${Math.floor(10000 + Math.random() * 90000)}`;
+}
+
+function isHoldLongerSession(store, code) {
+  return store[code]?.holdLonger === true;
+}
+
+function parseHoldLonger(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value.toLowerCase() === "true") return true;
+    if (value.toLowerCase() === "false") return false;
   }
 
-  return `${digits}`;
+  return undefined;
+}
+
+function setHoldLongerForCode(store, fileStore, uploadState, code, holdLonger) {
+  if (!store[code]) return false;
+
+  store[code].holdLonger = holdLonger;
+
+  if (fileStore[code]) {
+    fileStore[code].holdLonger = holdLonger;
+  }
+
+  for (const state of Object.values(uploadState)) {
+    if (state?.code === code) {
+      state.holdLonger = holdLonger;
+    }
+  }
+
+  return true;
+}
+
+function touchSession(store, code) {
+  if (!store[code]) return false;
+
+  store[code].lastUpdated = Date.now();
+  return true;
 }
 
 const storage = multer.diskStorage({
@@ -140,27 +193,55 @@ const chunkUpload = multer({
     },
   }),
   limits: {
-    fileSize: 2 * 1024 * 1024,
+    fileSize: MAX_CHUNK_SIZE,
   },
 });
 
-app.post("/api/session", (_req, res) => {
+app.post("/api/session", async (req, res) => {
+  const code = await runExclusive(() => {
+    const store = loadJSON(STORE_FILE);
+    const fileStore = loadJSON(FILESTORE_FILE);
+
+    let code;
+    do {
+      code = generateSessionCode();
+    } while (store[code] || fileStore[code]);
+
+    store[code] = {
+      type: "text",
+      content: "",
+      lastUpdated: Date.now(),
+      holdLonger: false,
+    };
+
+    saveJSON(STORE_FILE, store);
+    return code;
+  });
+
+  res.json({ code });
+});
+
+app.post("/api/session/:code/hold-longer", (req, res) => {
+  const code = req.params.code;
+  const holdLonger = parseHoldLonger(req.body?.holdLonger);
+
+  if (holdLonger === undefined) {
+    return res.status(400).json({ error: "Invalid data" });
+  }
+
   const store = loadJSON(STORE_FILE);
   const fileStore = loadJSON(FILESTORE_FILE);
+  const uploadState = loadUploadState();
 
-  let code;
-  do {
-    code = generateSessionCode();
-  } while (store[code] || fileStore[code]);
-
-  store[code] = {
-    type: "text",
-    content: "",
-    lastUpdated: Date.now(),
-  };
+  if (!setHoldLongerForCode(store, fileStore, uploadState, code, holdLonger)) {
+    return res.status(404).json({ error: "Not found" });
+  }
 
   saveJSON(STORE_FILE, store);
-  res.json({ code });
+  saveJSON(FILESTORE_FILE, fileStore);
+  saveUploadState(uploadState);
+
+  res.json({ ok: true });
 });
 
 app.post("/api/publish", (req, res) => {
@@ -170,7 +251,12 @@ app.post("/api/publish", (req, res) => {
   }
 
   const store = loadJSON(STORE_FILE);
-  store[code] = { type, content, lastUpdated: Date.now() };
+  store[code] = {
+    ...store[code],
+    type,
+    content,
+    lastUpdated: Date.now(),
+  };
   saveJSON(STORE_FILE, store);
 
   res.json({ ok: true });
@@ -191,12 +277,15 @@ app.post("/api/file/upload", upload.single("file"), (req, res) => {
     return res.status(400).json({ error: "Missing code or file" });
   }
 
+  const store = loadJSON(STORE_FILE);
   const fileStore = loadJSON(FILESTORE_FILE);
+  if (touchSession(store, code)) saveJSON(STORE_FILE, store);
   fileStore[code] = {
     originalName: file.originalname,
     size: file.size,
     path: file.path,
     uploadedAt: Date.now(),
+    holdLonger: isHoldLongerSession(store, code),
   };
 
   saveJSON(FILESTORE_FILE, fileStore);
@@ -211,7 +300,10 @@ app.post("/api/file/chunk", chunkUpload.single("file"), (req, res) => {
     return res.status(400).json({ error: "Missing fields" });
   }
 
+  const store = loadJSON(STORE_FILE);
   const state = loadUploadState();
+
+  if (touchSession(store, code)) saveJSON(STORE_FILE, store);
 
   if (!state[fileId]) {
     state[fileId] = {
@@ -219,6 +311,7 @@ app.post("/api/file/chunk", chunkUpload.single("file"), (req, res) => {
       totalSize: 0,
       chunks: {},
       createdAt: Date.now(),
+      holdLonger: isHoldLongerSession(store, code),
     };
   }
 
@@ -234,7 +327,7 @@ app.post("/api/file/chunk", chunkUpload.single("file"), (req, res) => {
     delete state[fileId].chunks[chunkIndex];
     state[fileId].totalSize -= chunkSize;
     saveUploadState(state);
-    return res.status(413).json({ error: "File exceeds 10MB limit" });
+    return res.status(413).json({ error: "File exceeds upload limit" });
   }
 
   saveUploadState(state);
@@ -243,6 +336,7 @@ app.post("/api/file/chunk", chunkUpload.single("file"), (req, res) => {
 
 app.post("/api/file/finalize", (req, res) => {
   const { code, fileId, totalChunks, fileName } = req.body;
+  const store = loadJSON(STORE_FILE);
   const state = loadUploadState();
   const meta = state[fileId];
 
@@ -268,6 +362,12 @@ app.post("/api/file/finalize", (req, res) => {
     delete state[fileId];
     saveUploadState(state);
 
+    touchSession(store, code);
+    saveJSON(STORE_FILE, store);
+
+    const effectiveHoldLonger =
+      meta.holdLonger === true || isHoldLongerSession(store, code);
+
     const fileStore = loadJSON(FILESTORE_FILE);
     fileStore[code] = {
       originalName: fileName,
@@ -275,6 +375,7 @@ app.post("/api/file/finalize", (req, res) => {
       path: finalPath,
       size: fs.statSync(finalPath).size,
       uploadedAt: Date.now(),
+      holdLonger: effectiveHoldLonger,
     };
     saveJSON(FILESTORE_FILE, fileStore);
 
